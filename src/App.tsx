@@ -11,6 +11,7 @@ function App() {
   const [isRecording, setIsRecording] = useState(false) // 현재 녹음 중인지 여부
   const mediaRecorderRef = useRef<MediaRecorder | null>(null) // MediaRecorder 인스턴스 저장
   const mediaStreamRef = useRef<MediaStream | null>(null) // MediaStream (마이크 입력) 저장
+  const audioContextRef = useRef<AudioContext | null>(null) // Web Audio API의 AudioContext 저장
 
   // WebSocket 연결 함수
   const connectWebSocket = () => {
@@ -20,7 +21,7 @@ function App() {
 
     setConnectionStatus('connecting')
     
-    // WebSocket 서버 주소 (필요에 따라 수정하세요)
+    // WebSocket 서버 주소
     const ws = new WebSocket('ws://localhost:8000/ws')
 
     ws.onopen = () => {
@@ -74,7 +75,7 @@ function App() {
     }
   }
 
-  // 녹음 시작 및 오디오 스트리밍 함수
+  // 녹음 시작 및 오디오 스트리밍 함수 (48000Hz로 리샘플링)
   const startRecording = async () => {
     // 서버와 연결되지 않았으면 경고 후 종료
     if (wsRef.current?.readyState !== WebSocket.OPEN) {
@@ -85,71 +86,102 @@ function App() {
     if (isRecording) return;
 
     try {
-      // 1. 사용자 마이크에 접근하여 MediaStream 객체 획득
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaStreamRef.current = stream;
+      // 1. Web Audio API를 사용하여 48000Hz로 리샘플링 준비
+      //    - 새로운 AudioContext를 목표 샘플링 레이트로 생성
+      const audioContext = new AudioContext({ sampleRate: 48000 });
+      audioContextRef.current = audioContext;
 
-      // 2. MediaStream을 기반으로 MediaRecorder 인스턴스 생성
-      //    - mimeType: 'audio/webm; codecs=opus'는 실시간 스트리밍에 효율적인 코덱.
-      //      백엔드(Google STT) 설정과 일치해야 함.
-      const mediaRecorder = new MediaRecorder(stream, {
+      // 2. 사용자 마이크에 접근하여 원본 MediaStream 획득
+      const originalStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // 3. 원본 스트림을 AudioContext의 소스로 연결
+      const source = audioContext.createMediaStreamSource(originalStream);
+      
+      // 4. 리샘플링된 오디오를 출력할 목적지(destination) 노드 생성
+      const destination = audioContext.createMediaStreamDestination();
+      
+      // 5. 소스(원본) -> 목적지(리샘플링)로 연결
+      source.connect(destination);
+
+      // 6. 리샘플링된 스트림을 MediaRecorder에 사용
+      //    - 이제 destination.stream은 항상 48000Hz 오디오 데이터를 가짐
+      const resampledStream = destination.stream;
+      mediaStreamRef.current = resampledStream; // 나중에 정리할 수 있도록 저장
+
+      const mediaRecorder = new MediaRecorder(resampledStream, {
         mimeType: 'audio/webm; codecs=opus',
       });
       mediaRecorderRef.current = mediaRecorder;
 
-      // 3. ondataavailable 이벤트 핸들러 설정
-      //    - MediaRecorder가 오디오 데이터를 청크(조각)로 만들 때마다 호출됨.
+      // 7. ondataavailable 이벤트 핸들러 설정
       mediaRecorder.ondataavailable = (event) => {
         // 데이터가 있고, WebSocket이 열려있을 때만 서버로 전송
         if (event.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
+          // 순수한 바이너리 데이터(Blob)를 직접 전송
           wsRef.current.send(event.data);
         }
       };
 
-      // 4. 녹음 상태 변경을 위한 이벤트 핸들러
+      // 8. 녹음 상태 변경을 위한 이벤트 핸들러
       mediaRecorder.onstart = () => {
         setIsRecording(true);
+        console.log('녹음 시작됨 (48000Hz).');
       };
 
+      // 녹음이 중지될 때 모든 오디오 관련 리소스를 정리
       mediaRecorder.onstop = () => {
+        // 모든 오디오 트랙 (원본, 리샘플링된 것) 중지
+        originalStream.getTracks().forEach(track => track.stop());
+        resampledStream.getTracks().forEach(track => track.stop());
+        
+        // AudioContext 닫기 (메모리 해제)
+        if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+          audioContextRef.current.close();
+        }
+
         setIsRecording(false);
+        console.log('녹음 중지됨. 모든 오디오 리소스 해제.');
       };
 
-      // 5. 녹음 시작
-      //    - 250ms 마다 ondataavailable 이벤트를 발생시켜 데이터를 청크로 분할.
+      // 9. 녹음 시작
       mediaRecorder.start(250);
 
     } catch (error) {
-      console.error('마이크 접근 오류:', error);
-      alert('마이크에 접근할 수 없습니다. 브라우저의 권한 설정을 확인해주세요.');
+      console.error('마이크 접근 또는 리샘플링 오류:', error);
+      alert('마이크에 접근할 수 없거나 오디오 처리에 실패했습니다. 브라우저의 권한 설정을 확인해주세요.');
     }
   };
 
   // 녹음 중지 함수
   const stopRecording = () => {
-    // MediaRecorder가 실행 중일 때만 중지
-    if (mediaRecorderRef.current && isRecording) {
+    // MediaRecorder가 실행 중일 때만 stop()을 호출.
+    // stop()이 호출되면 자동으로 onstop 이벤트 핸들러가 실행되어 리소스를 정리함.
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
       mediaRecorderRef.current.stop();
-    }
-    // MediaStream이 활성화 상태일 때 모든 트랙을 중지하여 마이크 사용 해제
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach(track => track.stop());
-      mediaStreamRef.current = null;
     }
   };
 
 
   // 컴포넌트가 언마운트될 때 실행되는 정리(cleanup) 함수
   useEffect(() => {
+    // 이 effect는 의존성 배열이 비어있으므로( [] ),
+    // 컴포넌트가 처음 렌더링될 때 한 번만 실행되고,
+    // 컴포넌트가 화면에서 사라질 때(unmount) return 안의 함수가 실행됩니다.
     return () => {
-      // 녹음 중이었다면 리소스 해제
-      if (isRecording) {
-        stopRecording();
+      console.log('컴포넌트 언마운트: 모든 리소스를 정리합니다.');
+
+      // 녹음 중이었다면 확실히 중지 (onstop 핸들러가 리소스 정리를 처리)
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        mediaRecorderRef.current.stop();
       }
-      // WebSocket 연결 해제
-      disconnectWebSocket()
-    }
-  }, [isRecording]) // isRecording 상태가 바뀔 때도 이 effect를 재평가
+      
+      // useEffect의 cleanup에서는 stream과 context 직접 정리는 onstop에 위임하고,
+      // 혹시 모를 WebSocket 연결만 확인하고 닫음
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, []); // 의존성 배열을 비워 unmount 시에만 실행되도록 수정
 
   return (
     <>      
