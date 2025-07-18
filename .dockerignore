@@ -1,0 +1,25 @@
+# Git 폴더 제외
+.git
+
+# node_modules 폴더 제외 (컨테이너 안에서 npm install로 설치하므로)
+node_modules
+
+# 빌드 결과물 폴더 제외 (컨테이너 안에서 npm run build로 생성하므로)
+dist
+
+# Docker 관련 파일 자체는 이미지에 포함될 필요 없음
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# 환경 변수 파일 (민감 정보)
+.env
+.env.local
+
+# 로그 파일
+*.log
+npm-debug.log*
+
+# IDE 및 에디터 설정 파일
+.vscode
+.idea
